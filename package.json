@@ -1,0 +1,38 @@
+{
+  "name": "sharkord-rss",
+  "version": "0.1.0",
+  "description": "Subscribe to RSS/Atom feeds and automatically post new articles to Sharkord text channels.",
+  "author": "Esseker",
+  "license": "MIT",
+  "homepage": "https://github.com/EssekerDev/sharkord-rss#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EssekerDev/sharkord-rss.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EssekerDev/sharkord-rss/issues"
+  },
+  "module": "src/server/index.ts",
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts",
+    "publish": "bun publish.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "rss-parser": "3.13.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/react": "19.2.14",
+    "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "@sharkord/plugin-sdk": "*"
+  },
+  "peerDependenciesMeta": {
+    "@sharkord/plugin-sdk": {
+      "optional": true
+    }
+  }
+}

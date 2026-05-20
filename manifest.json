@@ -1,0 +1,10 @@
+{
+  "id": "sharkord-rss",
+  "name": "Sharkord RSS",
+  "author": "Esseker",
+  "description": "Subscribe to RSS/Atom feeds and automatically post new articles to text channels.",
+  "homepage": "https://github.com/EssekerDev/sharkord-rss",
+  "logo": "https://raw.githubusercontent.com/EssekerDev/sharkord-rss/main/logo.png",
+  "sdkVersion": 1,
+  "version": "0.1.0"
+}
