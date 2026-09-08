@@ -1,8 +1,17 @@
-import type { PluginContext, PluginSettings } from '@sharkord/plugin-sdk';
+import type {
+  Permission,
+  PluginContext,
+  PluginSettings,
+  UnloadPluginContext,
+  UpgradePluginContext,
+  TUpgradeInfo
+} from '@sharkord/plugin-sdk';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join as joinPath } from 'node:path';
 import Parser from 'rss-parser';
 import manifest from '../../manifest.json';
 import {
@@ -11,6 +20,9 @@ import {
   type FeedConfig,
   type FeedStatus
 } from '../shared/types';
+import type { TFeedView, TPlugin, TSaveFeed } from '../types';
+
+type RssContext = PluginContext<TPlugin>;
 
 type SettingsDefinition = readonly [
   {
@@ -75,6 +87,7 @@ const MAX_FEED_BYTES = 5 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 const MAX_SEEN_PER_FEED = 1000;
 const FEEDS_SETTING = 'feeds';
+const SEEN_FILE = 'seen.json';
 const USER_AGENT = `sharkord-rss/${manifest.version} (+https://github.com/EssekerDev/sharkord-rss)`;
 
 const parser = new Parser<Record<string, unknown>, ParsedItem>();
@@ -82,6 +95,7 @@ const parser = new Parser<Record<string, unknown>, ParsedItem>();
 const statuses = new Map<string, FeedStatus>();
 const seenArticles = new Map<string, Set<string>>();
 let settingsRef: FeedSettings | undefined;
+let dataPathRef: string | undefined;
 let intervalId: ReturnType<typeof setInterval> | undefined;
 let polling = false;
 let settingsSnapshot = '';
@@ -91,6 +105,7 @@ let settingsSnapshot = '';
 // re-log `ctx.error` for the same invalid JSON every 10 s.
 let rawSnapshot = '';
 let unsubscribeSettings: (() => void) | undefined;
+let unsubscribeChannelDeleted: (() => void) | undefined;
 
 // Pure helper exposed for testing: produces a deterministic signature for any
 // settings value (string passthrough; structured value stringified). Falls back
@@ -355,7 +370,7 @@ const normalizeInterval = (intervalMinutes?: number): number => {
 
 // The setting is persisted as a JSON string; parse it defensively and skip any
 // invalid entry so one bad row never breaks the whole plugin.
-const parseStoredFeeds = (raw: unknown, ctx?: PluginContext): FeedConfig[] => {
+const parseStoredFeeds = (raw: unknown, ctx?: RssContext): FeedConfig[] => {
   try {
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
 
@@ -389,7 +404,7 @@ const parseStoredFeeds = (raw: unknown, ctx?: PluginContext): FeedConfig[] => {
           }
         ];
       } catch (error) {
-        ctx?.error('RSS settings skipped an invalid feed entry', {
+        ctx?.logger.error('RSS settings skipped an invalid feed entry', {
           index,
           reason: error instanceof Error ? error.message : String(error)
         });
@@ -397,7 +412,7 @@ const parseStoredFeeds = (raw: unknown, ctx?: PluginContext): FeedConfig[] => {
       }
     });
   } catch (error) {
-    ctx?.error('RSS settings parse failed', {
+    ctx?.logger.error('RSS settings parse failed', {
       reason: error instanceof Error ? error.message : String(error)
     });
     return [];
@@ -421,6 +436,91 @@ const serializeFeeds = (): FeedConfig[] => {
 
 const persistFeeds = (): void => {
   settingsRef?.set(FEEDS_SETTING, JSON.stringify(serializeFeeds()));
+};
+
+const seenFilePath = (): string | undefined =>
+  dataPathRef ? joinPath(dataPathRef, SEEN_FILE) : undefined;
+
+const loadSeen = async (): Promise<void> => {
+  const path = seenFilePath();
+  if (!path) return;
+
+  try {
+    const raw = await readFile(path, 'utf8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    seenArticles.clear();
+
+    for (const [url, ids] of Object.entries(data)) {
+      if (!Array.isArray(ids)) continue;
+      const seen = new Set<string>();
+      for (const id of ids) {
+        if (typeof id === 'string' && id.length > 0) rememberSeen(seen, id);
+      }
+      seenArticles.set(url, seen);
+    }
+  } catch {
+    // A missing or corrupt cache is rebuilt on the next bootstrap; do not fail the load.
+  }
+};
+
+const persistSeen = async (): Promise<void> => {
+  const path = seenFilePath();
+  if (!path) return;
+
+  const data: Record<string, string[]> = {};
+  for (const [url, ids] of seenArticles) {
+    data[url] = [...ids];
+  }
+
+  try {
+    await writeFile(path, JSON.stringify(data), 'utf8');
+  } catch {
+    // Persistence is best-effort; in-memory dedup still applies this session.
+  }
+};
+
+const toFeedViews = (): TFeedView[] =>
+  Array.from(statuses.values(), (status) => ({
+    url: status.url,
+    channelId: status.channelId,
+    intervalMinutes: status.intervalMinutes,
+    postOnBootstrap: status.postOnBootstrap === true,
+    bootstrappedAt: status.bootstrappedAt,
+    lastPolledAt: status.lastPolledAt,
+    articlesPosted: status.articlesPosted,
+    errorCount: status.errorCount,
+    backoffUntil: status.backoffUntil,
+    backoffDelayMinutes: status.backoffDelayMinutes
+  }));
+
+const assertAdmin = async (ctx: RssContext, userId: number): Promise<void> => {
+  if (!(await ctx.permissions.userCan(userId, 'MANAGE_PLUGINS' as Permission))) {
+    throw new Error('You cannot manage plugins.');
+  }
+};
+
+const parseSaveFeed = (payload: TSaveFeed): FeedConfig => {
+  if (typeof payload?.url !== 'string') {
+    throw new FeedError('INVALID_FEED', 'Feed URL must be a string.');
+  }
+  if (typeof payload.channelId !== 'number' || !Number.isInteger(payload.channelId)) {
+    throw new FeedError('INVALID_FEED', 'Pick a text channel.');
+  }
+
+  return {
+    url: normalizeUrl(payload.url),
+    channelId: payload.channelId,
+    intervalMinutes: normalizeInterval(payload.intervalMinutes),
+    postOnBootstrap: payload.postOnBootstrap === true
+  };
+};
+
+const applyFeedConfigs = async (ctx: RssContext, configs: FeedConfig[]): Promise<TFeedView[]> => {
+  const raw = JSON.stringify(configs);
+  settingsRef?.set(FEEDS_SETTING, raw);
+  await syncFeedsFromSettings(ctx, raw);
+  await persistSeen();
+  return toFeedViews();
 };
 
 // Build or refresh runtime status while preserving useful counters where possible.
@@ -745,7 +845,7 @@ const markExisting = (feedUrl: string, items: ParsedItem[]): MarkStats => {
 // Normal polling posts unseen entries oldest-first, then marks each article as
 // seen immediately so a later failure cannot duplicate already-sent messages.
 const postNewItems = async (
-  ctx: PluginContext,
+  ctx: RssContext,
   status: FeedStatus,
   items: ParsedItem[]
 ): Promise<PostStats> => {
@@ -769,7 +869,9 @@ const postNewItems = async (
     }
 
     rememberSeen(seen, id);
-    await ctx.messages.send(status.channelId, formatArticleMessage(item));
+    await ctx.messages.send(status.channelId, formatArticleMessage(item), {
+      previews: true
+    });
     stats.posted += 1;
     await sleep(SEND_DELAY_MS);
   }
@@ -780,7 +882,7 @@ const postNewItems = async (
 
 // Optional bootstrap posting is deliberately capped to keep first setup safe.
 const postBootstrapItems = async (
-  ctx: PluginContext,
+  ctx: RssContext,
   status: FeedStatus,
   items: ParsedItem[]
 ): Promise<PostStats> => {
@@ -790,7 +892,7 @@ const postBootstrapItems = async (
 // Polling is shared by the scheduler and by bootstrapping. It logs counts for
 // parsed, posted, skipped, and invalid articles.
 const pollFeed = async (
-  ctx: PluginContext,
+  ctx: RssContext,
   feedUrl: string,
   bootstrap: boolean
 ): Promise<number> => {
@@ -798,7 +900,7 @@ const pollFeed = async (
   if (!status) throw new FeedError('FEED_NOT_FOUND', 'Feed not found.');
 
   try {
-    ctx.debug(`RSS feed ${bootstrap ? 'bootstrap' : 'poll'} started: ${feedUrl}`);
+    ctx.logger.debug(`RSS feed ${bootstrap ? 'bootstrap' : 'poll'} started: ${feedUrl}`);
     const parsed = await parseFeed(status.url);
     const items = parsed.items ?? [];
     let posted = 0;
@@ -818,13 +920,13 @@ const pollFeed = async (
         status.bootstrappedAt = Date.now();
         persistFeeds();
       }
-      ctx.debug(
+      ctx.logger.debug(
         `RSS feed bootstrap completed: ${feedUrl} parsed=${items.length} posted=${postStats.posted} bootstrapLimit=${BOOTSTRAP_POST_LIMIT} indexed=${stats.indexed} ignoredAlreadySeen=${postStats.ignoredSeen} ignoredMissingId=${stats.ignoredMissingId} ignoredDuplicate=${stats.ignoredDuplicate} postedOnBootstrap=${shouldPostBootstrap}`
       );
     } else {
       const stats = await postNewItems(ctx, status, items);
       posted = stats.posted;
-      ctx.debug(
+      ctx.logger.debug(
         `RSS feed poll completed: ${feedUrl} parsed=${items.length} posted=${stats.posted} ignoredAlreadySeen=${stats.ignoredSeen} ignoredMissingId=${stats.ignoredMissingId}`
       );
     }
@@ -833,12 +935,13 @@ const pollFeed = async (
     status.errorCount = 0;
     status.articlesPosted += posted;
     scheduleNextNormalPoll(status);
+    await persistSeen();
 
     return posted;
   } catch (error) {
     status.errorCount += 1;
     scheduleNextBackoffPoll(status);
-    ctx.error(`RSS feed poll failed: ${feedUrl}`, {
+    ctx.logger.error(`RSS feed poll failed: ${feedUrl}`, {
       feedUrl,
       error: error instanceof Error ? error.message : String(error),
       errorCount: status.errorCount,
@@ -853,7 +956,7 @@ const pollFeed = async (
 // `polling` prevents overlapping ticks when a slow feed is still being parsed,
 // and `runSerialized` queues this work behind any in-flight settings sync so
 // the event handler and the scheduler never mutate runtime maps concurrently.
-const pollDueFeeds = async (ctx: PluginContext): Promise<void> => {
+const pollDueFeeds = async (ctx: RssContext): Promise<void> => {
   if (polling) return;
   polling = true;
 
@@ -875,9 +978,9 @@ const pollDueFeeds = async (ctx: PluginContext): Promise<void> => {
 // Verify a configured channel still exists and is a text channel. Checking this
 // at sync time surfaces a feed pointing at a missing/non-text channel immediately
 // instead of failing silently until an article is posted.
-const isTextChannel = async (ctx: PluginContext, channelId: number): Promise<boolean> => {
+const isTextChannel = async (ctx: RssContext, channelId: number): Promise<boolean> => {
   try {
-    const channel = (await ctx.data.getChannel(channelId)) as { type?: string } | undefined;
+    const channel = await ctx.channels.get(channelId);
     return channel?.type === 'TEXT';
   } catch {
     return false;
@@ -891,7 +994,7 @@ const isTextChannel = async (ctx: PluginContext, channelId: number): Promise<boo
 // stale value while the event is being dispatched (this caused newly-added
 // feeds to not bootstrap until the next scheduler tick).
 const syncFeedsFromSettings = async (
-  ctx: PluginContext,
+  ctx: RssContext,
   rawOverride?: unknown
 ): Promise<void> => {
   if (!settingsRef) return;
@@ -910,12 +1013,12 @@ const syncFeedsFromSettings = async (
   const snapshot = JSON.stringify(configs);
   if (snapshot === settingsSnapshot) return;
 
-  ctx.debug(`RSS settings sync started: configuredFeeds=${configs.length}`);
+  ctx.logger.debug(`RSS settings sync started: configuredFeeds=${configs.length}`);
   const nextUrls = new Set(configs.map((feed) => feed.url));
 
   for (const url of statuses.keys()) {
     if (!nextUrls.has(url)) {
-      ctx.debug(`RSS settings sync removed feed: ${url}`);
+      ctx.logger.debug(`RSS settings sync removed feed: ${url}`);
       statuses.delete(url);
       seenArticles.delete(url);
     }
@@ -931,7 +1034,7 @@ const syncFeedsFromSettings = async (
   for (let i = 0; i < configs.length; i += 1) {
     const config = configs[i]!;
     if (!channelValidity[i]) {
-      ctx.error('RSS feed skipped: target text channel not found', {
+      ctx.logger.error('RSS feed skipped: target text channel not found', {
         url: config.url,
         channelId: config.channelId
       });
@@ -945,68 +1048,189 @@ const syncFeedsFromSettings = async (
     statuses.set(config.url, status);
 
     if (!existing) {
-      await pollFeed(ctx, status.url, true);
+      const canSkipBootstrap =
+        seenArticles.has(status.url) && status.bootstrappedAt !== undefined;
+      await pollFeed(ctx, status.url, !canSkipBootstrap);
     } else {
-      ctx.debug(
+      ctx.logger.debug(
         `RSS settings sync updated feed: ${status.url} intervalMinutes=${status.intervalMinutes} channelId=${status.channelId}`
       );
     }
   }
 
   settingsSnapshot = snapshot;
-  ctx.debug(`RSS settings sync completed: activeFeeds=${statuses.size}`);
+  await persistSeen();
+  ctx.logger.debug(`RSS settings sync completed: activeFeeds=${statuses.size}`);
 };
 
 // React to the feeds setting being saved from the plugin settings dialog.
 // We pass `payload.value` straight through so the sync sees the fresh JSON
 // even if Sharkord's settings store has not finished committing yet.
-const registerSettingsListener = (ctx: PluginContext): void => {
+const registerSettingsListener = (ctx: RssContext): void => {
   unsubscribeSettings = ctx.events.on('setting:set', async (payload) => {
     if (payload.key !== FEEDS_SETTING) return;
     if (payload.pluginId && payload.pluginId !== ctx.pluginId) return;
 
-    ctx.debug('RSS settings update event received; syncing feeds now.');
+    ctx.logger.debug('RSS settings update event received; syncing feeds now.');
     await runSerialized(() => syncFeedsFromSettings(ctx, payload.value));
   });
 };
 
-const onLoad = async (ctx: PluginContext): Promise<void> => {
-  ctx.log('Sharkord RSS plugin loaded');
+const onLoad = async (ctx: RssContext): Promise<void> => {
+  ctx.logger.log('Sharkord RSS plugin loaded');
+  dataPathRef = ctx.dataPath;
+  await loadSeen();
 
   settingsRef = await ctx.settings.register([
     {
       key: FEEDS_SETTING,
       name: 'RSS feeds (JSON)',
       description:
-        'A JSON array of feeds. Each entry: {"url": string, "channelId": number, "intervalMinutes"?: number, "postOnBootstrap"?: boolean}. ' +
-        'Example: [{"url":"https://hnrss.org/frontpage","channelId":2,"intervalMinutes":15,"postOnBootstrap":false}]. ' +
-        'channelId is the numeric ID of a text channel. Only public http(s) feed URLs are accepted; invalid rows are ignored.',
+        'Power-user fallback: a JSON array of feeds. Prefer the Feeds tab. Each entry: {"url": string, "channelId": number, "intervalMinutes"?: number, "postOnBootstrap"?: boolean}. ' +
+        'Only public http(s) feed URLs are accepted; invalid rows are ignored.',
       type: 'string',
       defaultValue: '[]'
     }
   ] as const);
 
+  /**
+   * `requires` is only the default an admin can widen. Feed CRUD is server-wide
+   * config, so the real check happens inside each handler.
+   */
+  const assertAdminInvoker = async (userId: number) => assertAdmin(ctx, userId);
+
+  ctx.actions.register({
+    name: 'list',
+    description: 'Lists configured RSS feeds.',
+    requires: 'MANAGE_PLUGINS' as Permission,
+    executes: async (invoker) => {
+      await assertAdminInvoker(invoker.userId);
+      return toFeedViews();
+    }
+  });
+
+  ctx.actions.register({
+    name: 'create',
+    description: 'Adds an RSS/Atom feed.',
+    requires: 'MANAGE_PLUGINS' as Permission,
+    executes: async (invoker, payload) => {
+      await assertAdminInvoker(invoker.userId);
+      return runSerialized(async () => {
+        const config = parseSaveFeed(payload);
+        if (!(await isTextChannel(ctx, config.channelId))) {
+          throw new FeedError('INVALID_CHANNEL', 'Pick a text channel.');
+        }
+        if (serializeFeeds().some((feed) => feed.url === config.url)) {
+          throw new FeedError('DUPLICATE_FEED', 'A feed with this URL already exists.');
+        }
+        return applyFeedConfigs(ctx, [...serializeFeeds(), config]);
+      });
+    }
+  });
+
+  ctx.actions.register({
+    name: 'update',
+    description: 'Updates an RSS/Atom feed.',
+    requires: 'MANAGE_PLUGINS' as Permission,
+    executes: async (invoker, payload) => {
+      await assertAdminInvoker(invoker.userId);
+      return runSerialized(async () => {
+        const previousUrl = normalizeUrl(payload.previousUrl);
+        const config = parseSaveFeed(payload);
+        if (!(await isTextChannel(ctx, config.channelId))) {
+          throw new FeedError('INVALID_CHANNEL', 'Pick a text channel.');
+        }
+
+        const configs = serializeFeeds();
+        const index = configs.findIndex((feed) => feed.url === previousUrl);
+        if (index < 0) {
+          throw new FeedError('FEED_NOT_FOUND', 'That feed no longer exists.');
+        }
+
+        if (config.url !== previousUrl && configs.some((feed) => feed.url === config.url)) {
+          throw new FeedError('DUPLICATE_FEED', 'A feed with this URL already exists.');
+        }
+
+        const previous = configs[index]!;
+        configs[index] = {
+          ...config,
+          bootstrappedAt:
+            config.url === previousUrl ? previous.bootstrappedAt : undefined
+        };
+
+        if (config.url !== previousUrl) {
+          const seen = seenArticles.get(previousUrl);
+          if (seen) {
+            seenArticles.set(config.url, seen);
+            seenArticles.delete(previousUrl);
+          }
+          statuses.delete(previousUrl);
+        }
+
+        return applyFeedConfigs(ctx, configs);
+      });
+    }
+  });
+
+  ctx.actions.register({
+    name: 'remove',
+    description: 'Removes an RSS/Atom feed.',
+    requires: 'MANAGE_PLUGINS' as Permission,
+    executes: async (invoker, payload) => {
+      await assertAdminInvoker(invoker.userId);
+      return runSerialized(async () => {
+        const url = normalizeUrl(payload.url);
+        const configs = serializeFeeds().filter((feed) => feed.url !== url);
+        seenArticles.delete(url);
+        statuses.delete(url);
+        return applyFeedConfigs(ctx, configs);
+      });
+    }
+  });
+
   await syncFeedsFromSettings(ctx);
   registerSettingsListener(ctx);
+
+  unsubscribeChannelDeleted = ctx.events.on('channel:deleted', async (payload) => {
+    const channelId = payload.channelId;
+    if (typeof channelId !== 'number') return;
+
+    await runSerialized(async () => {
+      const remaining = serializeFeeds().filter((feed) => feed.channelId !== channelId);
+      if (remaining.length === serializeFeeds().length) return;
+
+      ctx.logger.log(`RSS dropped feeds targeting deleted channel ${channelId}`);
+      await applyFeedConfigs(ctx, remaining);
+    });
+  });
+
   intervalId = setInterval(() => {
-    pollDueFeeds(ctx).catch((error) => ctx.error('RSS polling loop failed', error));
+    pollDueFeeds(ctx).catch((error) => ctx.logger.error('RSS polling loop failed', error));
   }, POLL_TICK_MS);
 };
 
 // Unload must release timers and listeners because Sharkord can disable or
 // reload plugins without restarting the whole server process.
-const onUnload = (ctx: PluginContext): void => {
+const onUnload = async (ctx: UnloadPluginContext): Promise<void> => {
   if (intervalId) clearInterval(intervalId);
   unsubscribeSettings?.();
   unsubscribeSettings = undefined;
+  unsubscribeChannelDeleted?.();
+  unsubscribeChannelDeleted = undefined;
   intervalId = undefined;
   polling = false;
   settingsSnapshot = '';
   rawSnapshot = '';
+  await persistSeen();
   statuses.clear();
   seenArticles.clear();
   settingsRef = undefined;
-  ctx.log('Sharkord RSS plugin unloaded');
+  dataPathRef = undefined;
+  ctx.logger.log('Sharkord RSS plugin unloaded');
+};
+
+const onUpgrade = async (ctx: UpgradePluginContext, info: TUpgradeInfo): Promise<void> => {
+  ctx.logger.log(`Sharkord RSS upgrading ${info.previousVersion} → ${info.version}`);
 };
 
 // Internal helpers are also exported so the test suite (`index.test.ts`) can
@@ -1028,6 +1252,7 @@ export {
   normalizeUrl,
   onLoad,
   onUnload,
+  onUpgrade,
   parseStoredFeeds,
   rememberSeen,
   stripHtml,

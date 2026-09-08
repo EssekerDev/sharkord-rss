@@ -1,8 +1,18 @@
+import type { ComponentType } from 'react';
 import type { TPluginComponentsMapBySlotId } from '@sharkord/plugin-sdk';
+import { Feeds } from './feeds';
 
-// This plugin is configured entirely from the admin-only plugin settings dialog
-// (Server Settings -> Extensions). It does not register any client components,
-// so no buttons, pages, or chat UI are added for regular members.
+type TPluginTabs = Array<{
+  id: string;
+  label: string;
+  component: ComponentType;
+}>;
+
+// No chat or home-screen UI: members never see this plugin. The Feeds tab
+// is added to the plugin's own page in server settings, which only someone
+// who can manage plugins can open.
 const components: TPluginComponentsMapBySlotId = {};
 
-export { components };
+const tabs: TPluginTabs = [{ id: 'feeds', label: 'Feeds', component: Feeds }];
+
+export { components, tabs };
