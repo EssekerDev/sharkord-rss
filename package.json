@@ -1,6 +1,6 @@
 {
   "name": "sharkord-rss",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Subscribe to RSS/Atom feeds and automatically post new articles to Sharkord text channels.",
   "author": "Esseker",
   "license": "MIT",

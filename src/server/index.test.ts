@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { DEFAULT_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES } from '../shared/types';
 import type { FeedStatus } from '../shared/types';
 import {
+  buildFeedRequestOptions,
   cleanText,
   computeRawSettingsSignature,
   decodeEntities,
@@ -18,6 +19,7 @@ import {
   parseStoredFeeds,
   rememberSeen,
   stripHtml,
+  tlsServernameForUrl,
   validatePublicHttpUrl
 } from './index';
 
@@ -224,6 +226,44 @@ describe('validatePublicHttpUrl + normalizeUrl', () => {
   test('normalizeUrl rejects empty string', () => {
     expect(() => normalizeUrl('')).toThrow(FeedError);
     expect(() => normalizeUrl('   ')).toThrow(FeedError);
+  });
+});
+
+describe('tlsServernameForUrl + buildFeedRequestOptions (issue #1)', () => {
+  test('pins HTTPS SNI to the DNS hostname, not an IP', () => {
+    const url = new URL('https://steamcommunity.com/games/275850/rss/');
+    expect(tlsServernameForUrl(url)).toBe('steamcommunity.com');
+
+    const options = buildFeedRequestOptions(url);
+    expect(options.hostname).toBe('steamcommunity.com');
+    expect(options.servername).toBe('steamcommunity.com');
+    expect((options.headers as Record<string, string>).Host).toBe('steamcommunity.com');
+    expect(typeof options.checkServerIdentity).toBe('function');
+  });
+
+  test('keeps Host header with non-default port', () => {
+    const url = new URL('https://example.com:8443/feed.xml');
+    const options = buildFeedRequestOptions(url);
+    expect(options.servername).toBe('example.com');
+    expect(options.port).toBe('8443');
+    expect((options.headers as Record<string, string>).Host).toBe('example.com:8443');
+  });
+
+  test('omits SNI override for plain HTTP', () => {
+    const url = new URL('http://example.com/feed.xml');
+    expect(tlsServernameForUrl(url)).toBeUndefined();
+    const options = buildFeedRequestOptions(url);
+    expect(options.servername).toBeUndefined();
+    expect(options.checkServerIdentity).toBeUndefined();
+  });
+
+  test('omits SNI override for public IP literals (verify against iPAddress SAN)', () => {
+    const v4 = new URL('https://8.8.8.8/feed.xml');
+    expect(tlsServernameForUrl(v4)).toBeUndefined();
+    expect(buildFeedRequestOptions(v4).servername).toBeUndefined();
+
+    const v6 = new URL('https://[2001:4860:4860::8888]/feed.xml');
+    expect(tlsServernameForUrl(v6)).toBeUndefined();
   });
 });
 

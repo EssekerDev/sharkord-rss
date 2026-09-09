@@ -10,6 +10,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
 import { isIP } from 'node:net';
+import { checkServerIdentity as tlsCheckServerIdentity } from 'node:tls';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join as joinPath } from 'node:path';
 import Parser from 'rss-parser';
@@ -611,6 +612,17 @@ const formatArticleDate = (item: ParsedItem): string | undefined => {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 };
 
+// Pin TLS SNI / certificate identity to the URL hostname, never the resolved
+// IP. Custom `lookup` (and some Bun versions) can dial by address; if SNI
+// follows that IP, Akamai-style CDNs fail with ERR_TLS_CERT_ALTNAME_INVALID
+// against `https://23.x.x.x/...` instead of the original host (issue #1).
+const tlsServernameForUrl = (url: URL): string | undefined => {
+  if (url.protocol !== 'https:') return undefined;
+  const host = url.hostname.replace(/^\[/, '').replace(/\]$/, '');
+  if (!host || isIP(host)) return undefined;
+  return host;
+};
+
 // Custom DNS lookup used by every outbound feed request. Resolving here (rather
 // than letting rss-parser do its own fetch) lets us reject any answer that
 // maps to a private/loopback address before a TCP socket is opened, closing
@@ -659,6 +671,31 @@ const safeLookup = (
   });
 };
 
+const buildFeedRequestOptions = (url: URL): https.RequestOptions => {
+  const servername = tlsServernameForUrl(url);
+  return {
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port || undefined,
+    path: `${url.pathname}${url.search}`,
+    method: 'GET',
+    headers: {
+      Host: url.host,
+      'User-Agent': USER_AGENT,
+      Accept:
+        'application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5'
+    },
+    lookup: safeLookup as unknown as typeof dnsLookup,
+    ...(servername
+      ? {
+          servername,
+          checkServerIdentity: (_peerHost: string, cert) =>
+            tlsCheckServerIdentity(servername, cert)
+        }
+      : {})
+  };
+};
+
 type FetchOutcome = { kind: 'body'; body: string } | { kind: 'redirect'; location: string };
 
 const fetchOnce = (url: URL): Promise<FetchOutcome> => {
@@ -669,17 +706,7 @@ const fetchOnce = (url: URL): Promise<FetchOutcome> => {
     const requestModule = url.protocol === 'https:' ? https : http;
     const request = requestModule.request(
       {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || undefined,
-        path: `${url.pathname}${url.search}`,
-        method: 'GET',
-        headers: {
-          'User-Agent': USER_AGENT,
-          Accept:
-            'application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5'
-        },
-        lookup: safeLookup as unknown as typeof dnsLookup,
+        ...buildFeedRequestOptions(url),
         signal: controller.signal
       },
       (response) => {
@@ -780,8 +807,9 @@ const fetchFeedXml = async (initialUrl: string): Promise<string> => {
 };
 
 // Outbound fetching is wrapped so we can pin DNS resolution to non-private
-// addresses, cap response size, and feed the raw XML into rss-parser without
-// surrendering control of the network stack.
+// addresses, pin TLS SNI to the original hostname (issue #1), cap response
+// size, and feed the raw XML into rss-parser without surrendering control of
+// the network stack.
 const parseFeed = async (url: string): Promise<ParsedFeed> => {
   const body = await fetchFeedXml(url);
   return (await parser.parseString(body)) as ParsedFeed;
@@ -1237,6 +1265,7 @@ const onUpgrade = async (ctx: UpgradePluginContext, info: TUpgradeInfo): Promise
 // exercise them directly. The plugin runtime only consumes `onLoad`/`onUnload`,
 // and the bundler tree-shakes the rest out of the production bundle.
 export {
+  buildFeedRequestOptions,
   cleanText,
   computeRawSettingsSignature,
   decodeEntities,
@@ -1256,5 +1285,6 @@ export {
   parseStoredFeeds,
   rememberSeen,
   stripHtml,
+  tlsServernameForUrl,
   validatePublicHttpUrl
 };

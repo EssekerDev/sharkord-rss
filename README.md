@@ -28,11 +28,11 @@
 
 ### From the marketplace
 
-Once **0.2.0** is listed, install or update it from **Extensions → Marketplace**. Servers on SDK v2 only offer versions whose `sdkVersion` is 2, so 0.1.1 will no longer appear.
+Once **0.2.1** is listed, install or update it from **Extensions → Marketplace**. Servers on SDK v2 only offer versions whose `sdkVersion` is 2, so 0.1.1 will no longer appear.
 
 Until the registry PR is merged, install the GitHub release manually:
 
-1. Download `sharkord-rss-0.2.0.tar.gz` from [Releases](https://github.com/EssekerDev/sharkord-rss/releases).
+1. Download `sharkord-rss-0.2.1.tar.gz` from [Releases](https://github.com/EssekerDev/sharkord-rss/releases).
 2. Unpack it into your Sharkord plugins folder as `sharkord-rss/` (the folder name must match the plugin id).
 3. In **Server Settings → Extensions**, enable **Sharkord RSS**.
 
@@ -82,7 +82,7 @@ Invalid rows are skipped, so one bad entry never breaks the others.
 
 The error `Plugin SDK version 1 is not compatible with server SDK version 2` means the installed plugin still declares `sdkVersion: 1`. Sharkord refuses to load it on purpose.
 
-What 0.2.0 changes:
+What 0.2.x changes:
 
 | 0.1.1 (SDK 1) | 0.2.0 (SDK 2) |
 |---|---|
@@ -95,13 +95,17 @@ What 0.2.0 changes:
 
 Feed settings live in the Sharkord database, so they survive the plugin folder being replaced. You do not need to re-enter URLs.
 
-After installing 0.2.0, publish a GitHub release and open a PR on [Sharkord/plugins](https://github.com/Sharkord/plugins) so the marketplace offers the SDK 2 build. Until that lands, only a manual install unblocks users.
+After installing 0.2.1, publish a GitHub release and open a PR on [Sharkord/plugins](https://github.com/Sharkord/plugins) so the marketplace offers the SDK 2 build. Until that lands, only a manual install unblocks users.
 
 ```bash
 bun run publish
 ```
 
-Then add `plugins/sharkord-rss/versions/0.2.0.json` from the release assets to the registry.
+Then add `plugins/sharkord-rss/versions/0.2.1.json` from the release assets to the registry.
+
+### 0.2.1 — TLS hostname pin ([#1](https://github.com/EssekerDev/sharkord-rss/issues/1))
+
+HTTPS feeds on some CDNs (Steam Community / Akamai) failed with `ERR_TLS_CERT_ALTNAME_INVALID` because Bun verified the certificate against the **resolved IP** (`https://23.x.x.x/...`) instead of the hostname. 0.2.1 forces TLS SNI and `checkServerIdentity` to the original DNS name, while still using the SSRF-safe custom DNS lookup.
 
 ---
 
